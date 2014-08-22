@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+
+##############################################################################
+#   CEGUI abi checker
+#
+#   Copyright (C) 2014   Martin Preisler <martin@preisler.me>
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+##############################################################################
+
+# I would have preferred a bash script or a Makefile but to potentially
+# allow Windows folks to use this as well I have chosen python in the end
+
+import sys
+import os
+import argparse
+import subprocess
+import shutil
+
+
+def get_temporary_directory_path():
+    temp_directory_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "local-temp")
+    )
+
+    if not os.path.exists(temp_directory_path):
+        os.mkdir(temp_directory_path)
+
+    return temp_directory_path
+
+
+def parse_cegui_branch(branch):
+    if branch[0] != "v":
+        raise RuntimeError("'%s' is not a valid CEGUI version branch/tag! 'v' is not the first character." % (branch))
+
+    branch = branch[1:]
+    split = branch.split("-")
+
+    if len(split) == 2: # maintenance branch
+        return (split[0], split[1], 9999)
+
+    if len(split) == 3:
+        assert(int(split[2]) < 9999)
+        return (split[0], split[1], split[2])
+
+    raise RuntimeError("'%s' doesn't have 2 or 3 version components, instead "
+                       "it has %i components! Doesn't look like a version tag "
+                       "or a maintenance branch." % (branch, len(split)))
+
+
+def abi_check(abi_branch):
+    old_cwd = os.getcwd()
+
+    try:
+        temp_directory_path = get_temporary_directory_path()
+        os.chdir(temp_directory_path)
+
+        print("*** Making sure the cegui repository is up to date...")
+        if os.path.exists("cegui"):
+            os.chdir("cegui")
+            subprocess.check_call(["hg", "pull"])
+            os.chdir(temp_directory_path)
+        else:
+            subprocess.check_call(["hg", "clone",
+                                   "http://bitbucket.org/cegui/cegui",
+                                   "cegui"])
+
+        print("*** cegui is up to date now!")
+
+        def build_branch(branch, target_path):
+            ver_major, ver_minor, ver_patch = parse_cegui_branch(branch)
+            ver_major = int(ver_major)
+            ver_minor = int(ver_minor)
+            ver_patch = int(ver_patch)
+
+            # we do not support older versions, CEGUI only makes ABI/API
+            # promises from 0.8.0 on
+            assert((ver_major, ver_minor, ver_patch) >= (0, 8, 0))
+
+            os.chdir(os.path.join(temp_directory_path, "cegui"))
+
+            print("*** Preparing to build '%s' branch and install results to '%s'" % (branch, target_path))
+            subprocess.check_call(["hg", "update", "-C", branch])
+
+            if os.path.exists(target_path):
+                print("*** The path already exists, deleting the whole tree ('%s')..." % (target_path))
+                shutil.rmtree(target_path)
+
+            build_dir = os.path.join(temp_directory_path, "cegui", "build")
+
+            if os.path.exists(build_dir):
+                shutil.rmtree(build_dir)
+
+            os.mkdir(build_dir)
+            os.chdir(build_dir)
+
+            subprocess.check_call(
+                ["cmake",
+                 "-DCMAKE_INSTALL_PREFIX=/usr",
+                 "-DCEGUI_BUILD_PYTHON_MODULES:BOOL=OFF",
+                 "../"])
+
+            print("*** Building %s..." % (branch))
+            # TODO: figure out the number of CPUs
+            subprocess.check_call(["make", "-j", "4"])
+
+            print("*** Installing %s to '%s'..." % (branch, target_path))
+            subprocess.check_call(
+                ["make", "install", "DESTDIR=%s" % (target_path)])
+
+            with open(os.path.join(target_path, "descriptor.xml"), 'w') as f:
+                f.write(
+                    "<desc>\n"
+                    "    <version>%i.%i.%i</version>\n"
+                    "    <headers>%s</headers>\n"
+                    "    <libs>%s</libs>\n"
+                    "    <include_preamble>\n"
+                    "        glew.h\n"
+                    "        stddef.h\n"
+                    "    </include_preamble>\n"
+                    "    <skip_including>\n"
+                    "        WGLPBTextureTarget.h\n"
+                    "        MemoryOgreAllocator.h\n"
+                    "        ApplePBTextureTarget.h\n"
+                    "    </skip_including>\n"
+                    "</desc>" %
+                    (ver_major, ver_minor, ver_patch,
+                     os.path.join(target_path, "usr", "include", "cegui-%i" % (ver_major)),
+                     os.path.join(target_path, "usr", "lib64", "libCEGUIBase-0.so"))
+                )
+
+        os.chdir(os.path.join(temp_directory_path, "cegui"))
+        # actually it's tags, but whatever, it's all the same
+        branches_output = subprocess.check_output(
+            ["hg", "tags"]).decode("utf-8").split("\n")
+        branches_output.append("%s             abc" % (abi_branch))
+
+        branches_to_check = []
+        for branch_line in branches_output:
+            try:
+                try:
+                    branch, commit = branch_line.split(" ", 1)
+
+                except ValueError:
+                    print("'%s'" % (branch_line))
+
+                if branch == "tip":
+                    continue
+
+                if not branch.startswith(abi_branch):
+                    continue
+
+                ver_major, ver_minor, ver_patch = parse_cegui_branch(branch)
+                rel_dir = "%s.%s.%s" % (ver_major, ver_minor, ver_patch)
+                target_dir = os.path.join(temp_directory_path, "output", rel_dir)
+
+                build_branch(branch, target_dir)
+                branches_to_check.append(rel_dir)
+
+            except:
+                raise
+            #    print("Can't build branch '%s'." % (branch))
+
+        def version_tuple(branch_string):
+            ret = branch_string.split(".")
+            assert(len(ret) == 3)
+            return ret
+
+        branches_to_check = sorted(branches_to_check, key = version_tuple)
+
+        print("Will check the following versions in this order:")
+        print("\n".join(branches_to_check))
+
+        if len(branches_to_check) >= 2:
+            old_branch = branches_to_check[0]
+            i = 1
+            while i < len(branches_to_check):
+                new_branch = branches_to_check[i]
+
+                print("Checking compatibility between %s and %s..." % (old_branch, new_branch))
+
+                try:
+                    subprocess.check_output(
+                        ["abi-compliance-checker",
+                         "-l", "CEGUIBase",
+                         "-old", os.path.join(temp_directory_path, "output", old_branch, "descriptor.xml"),
+                         "-new", os.path.join(temp_directory_path, "output", new_branch, "descriptor.xml")],
+                        cwd = os.path.join(temp_directory_path, "output")
+                    )
+                    print("-> compatible!")
+
+                except subprocess.CalledProcessError as e:
+                    print("%s and %s are likely incompatible!" % (old_branch, new_branch))
+                    print(e.output.decode("utf8"))
+
+                old_branch = new_branch
+                i += 1
+
+    finally:
+        os.chdir(old_cwd)
+
+
+def clean():
+    temp_directory_path = get_temporary_directory_path()
+    shutil.rmtree(temp_directory_path)
+
+    print("*** No local temporary directory present now!")
+
+
+def main():
+    parser = argparse.ArgumentParser(description = "CEGUI abi checker")
+
+    parser.add_argument(
+        "task", type = str, default = "abi_check",
+        help = "Which task do you want to perform? (choices: abi_check, clean)"
+    )
+
+    parser.add_argument(
+        "--branch", type = str, default = "v0-8",
+        help = "Which branch should be ABI checked (only valid with task = 'build')"
+    )
+
+    args = parser.parse_args()
+
+    if args.task == "abi_check":
+        abi_check(args.branch)
+
+    elif args.task == "clean":
+        clean()
+
+    else:
+        print("*** No valid task provided")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
